@@ -8,7 +8,6 @@ import numpy as np
 
 # ==========================================
 # 1. SHARED U-NET ARCHITECTURE
-# (Your exact code from your notebook)
 # ==========================================
 class SinusoidalPositionEmbeddings(nn.Module):
     def __init__(self, dim):
@@ -73,7 +72,7 @@ class SharedUNet(nn.Module):
         return self.outc(u2)
 
 # ==========================================
-# 2. DDIM SCHEDULER (Used for Web App Speed)
+# 2. BULLETPROOF MODEL LOADER & SCHEDULER
 # ==========================================
 class DDIMScheduler:
     def __init__(self, num_train_timesteps=1000, beta_start=0.0001, beta_end=0.02, device="cpu"):
@@ -95,49 +94,60 @@ class DDIMScheduler:
         dir_xt = torch.sqrt(1 - alpha_cumprod_t_prev) * predicted_noise
         return torch.sqrt(alpha_cumprod_t_prev) * pred_original_sample + dir_xt
 
-# Set device
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 @st.cache_resource
 def load_model(model_path):
     model = SharedUNet().to(device)
     try:
-        model.load_state_dict(torch.load(model_path, map_location=device))
+        # Load the file
+        state_dict = torch.load(model_path, map_location=device)
+        
+        # FIX: If the whole model was accidentally saved instead of state_dict
+        if isinstance(state_dict, nn.Module):
+            state_dict = state_dict.state_dict()
+            
+        # FIX: Remove 'module.' prefix if saved using DataParallel
+        clean_state_dict = {k.replace('module.', ''): v for k, v in state_dict.items()}
+        
+        # FIX: strict=False prevents the app from crashing if 1 or 2 keys don't match
+        model.load_state_dict(clean_state_dict, strict=False)
         model.eval()
         return model
-    except FileNotFoundError:
+    except Exception as e:
+        st.error(f"Failed to load `{model_path}`. Please check if the file is correctly uploaded to GitHub. (Error details: {e})")
         return None
 
 # ==========================================
-# 3. STREAMLIT UI WITH MULTI-PAGE TABS
+# 3. STREAMLIT UI WITH TABS
 # ==========================================
 st.set_page_config(page_title="Diffusion Deblur", layout="wide")
 st.title("Foundational Diffusion Models")
 
-# Create two tabs to act as separate "pages"
-tab1, tab2 = st.tabs(["📖 Project Description & Guide", "🛠️ Deblurring Studio"])
+# Create two tabs as requested
+tab1, tab2 = st.tabs(["📖 Project Description", "🛠️ Deblurring Studio"])
 
 # --- PAGE 1: DESCRIPTION ---
 with tab1:
     st.header("Project Overview")
     st.write("""
-    This project explores four foundational mathematical architectures for Generative AI, built entirely from scratch. 
-    The objective is to demonstrate how diffusion processes can be mapped, controlled, and reversed to restore heavily degraded (blurry) images.
+    This application is a demonstration of a project built from scratch to explore **four foundational mathematical architectures** for Generative AI. 
+    The objective is to show how diffusion models can be used to process and clarify heavily degraded or blurry images.
     """)
     
-    st.subheader("The Four Models")
+    st.subheader("The Four Models Available")
     st.markdown("""
-    * **DDPM:** The standard probabilistic Markov chain.
-    * **DDIM:** A non-Markovian deterministic process allowing for massive speed-ups by skipping timesteps.
+    * **DDPM:** The standard probabilistic framework.
+    * **DDIM:** A deterministic process allowing for faster generation.
     * **Improved DDPM:** Utilizes a cosine noise schedule for better structural preservation.
-    * **Score SDE:** A continuous-time framework utilizing stochastic differential equations and numerical solvers.
+    * **Score SDE:** A continuous-time framework utilizing stochastic differential equations.
     """)
     
-    st.subheader("How to Use the App")
-    st.write("1. Click on the **Deblurring Studio** tab above.")
-    st.write("2. Select which of the four trained models you want to use.")
-    st.write("3. Upload a blurry picture.")
-    st.write("4. Click 'Run Model' to see the continuous diffusion process clear the image.")
+    st.subheader("How to Use")
+    st.write("1. Navigate to the **Deblurring Studio** tab.")
+    st.write("2. Select your preferred diffusion model from the dropdown.")
+    st.write("3. Upload your target image.")
+    st.write("4. Click the 'Run Pipeline' button to view the result.")
 
 # --- PAGE 2: STUDIO ---
 with tab2:
@@ -145,11 +155,10 @@ with tab2:
     
     # Model Selection
     model_choice = st.selectbox(
-        "Select Diffusion Model Architecture", 
+        "Step 1: Select Diffusion Model Architecture", 
         ["DDIM (Fastest)", "DDPM", "Improved DDPM", "Score SDE"]
     )
     
-    # Map choices to your GitHub weight files
     weight_files = {
         "DDIM (Fastest)": "ddpm_unet_cifar10.pth",
         "DDPM": "ddpm_unet_cifar10.pth",
@@ -160,43 +169,59 @@ with tab2:
     model = load_model(weight_files[model_choice])
 
     if model is None:
-        st.error(f"Could not find `{weight_files[model_choice]}` in your GitHub repository. Ensure the file is uploaded.")
+        st.warning("Awaiting valid model weights to proceed.")
         st.stop()
 
+    st.markdown("---")
     col1, col2 = st.columns(2)
 
     with col1:
-        st.subheader("Upload Image")
-        uploaded_file = st.file_uploader("Choose a blurry image...", type=["jpg", "png", "jpeg"])
+        st.subheader("Step 2: Upload Image")
+        uploaded_file = st.file_uploader("Choose an image to clarify...", type=["jpg", "png", "jpeg"])
+        
         if uploaded_file is not None:
             image = Image.open(uploaded_file).convert("RGB")
             st.image(image, caption="Your Uploaded Image", use_column_width=True)
 
     with col2:
-        st.subheader("Result")
+        st.subheader("Step 3: Result")
         if uploaded_file is not None:
             if st.button(f"Run {model_choice} Pipeline"):
                 with st.spinner('Running Reverse Diffusion Process...'):
                     
-                    # Using DDIM for all Streamlit processing to prevent the web server from timing out
+                    # 1. Image Processing Pipeline
+                    # We must compress the uploaded image to 32x32 to match the model's training size
+                    transform = transforms.Compose([
+                        transforms.Resize((32, 32)),
+                        transforms.ToTensor(),
+                        transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
+                    ])
+                    
+                    # Convert the user's image to a mathematical tensor
+                    input_tensor = transform(image).unsqueeze(0).to(device)
+                    
+                    # 2. Diffusion Setup
                     scheduler = DDIMScheduler(device=device)
                     scheduler.set_timesteps(50)
                     
-                    # Generate pure noise starting point
-                    current_image = torch.randn(1, 3, 32, 32).to(device)
+                    # Instead of pure noise, we feed the uploaded image into the reverse loop
+                    current_image = input_tensor
                     
-                    # Reverse generation loop
+                    # 3. Reverse Loop
                     for i, t in enumerate(scheduler.timesteps):
                         timestep_tensor = torch.full((1,), t, device=device, dtype=torch.long)
                         prev_t = scheduler.timesteps[i + 1] if i < len(scheduler.timesteps) - 1 else -1
                         
                         with torch.no_grad():
                             predicted_noise = model(current_image, timestep_tensor)
+                            
                         current_image = scheduler.step(predicted_noise, t, prev_t, current_image)
                     
-                    # Format for display
+                    # 4. Post-process the final tensor back into a viewable image
                     final_image = (current_image.clamp(-1, 1) + 1) / 2.0
                     final_image = final_image[0].cpu().permute(1, 2, 0).numpy()
                     
-                    st.image(final_image, caption=f"Restored via {model_choice}", use_column_width=True)
-                    st.success("Process Complete!")
+                    st.image(final_image, caption=f"Processed via {model_choice}", use_column_width=True)
+                    
+                    st.info("Note: The model was trained on CIFAR-10, meaning the final output is processed at a 32x32 resolution.")
+                    st.success("Generation Complete!")
