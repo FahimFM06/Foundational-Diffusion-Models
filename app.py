@@ -7,7 +7,7 @@ from PIL import Image
 import numpy as np
 
 # ==========================================
-# 1. SHARED U-NET ARCHITECTURE (FIXED DIMENSIONS)
+# 1. DYNAMIC SHAPE-SHIFTING U-NET
 # ==========================================
 class SinusoidalPositionEmbeddings(nn.Module):
     def __init__(self, dim):
@@ -39,8 +39,12 @@ class Block(nn.Module):
         return self.transform(h) + self.residual_conv(x)
 
 class SharedUNet(nn.Module):
-    def __init__(self, in_channels=3, out_channels=3, time_emb_dim=256):
+    # Added dynamic channel variables so the app adapts to the specific checkpoint
+    def __init__(self, in_channels=3, out_channels=3, time_emb_dim=256, up1_in=384, up2_in=192):
         super().__init__()
+        self.up1_in = up1_in
+        self.up2_in = up2_in
+        
         self.time_mlp = nn.Sequential(SinusoidalPositionEmbeddings(time_emb_dim), nn.Linear(time_emb_dim, time_emb_dim), nn.SiLU())
         self.inc = nn.Conv2d(in_channels, 64, kernel_size=3, padding=1)
         self.down1 = Block(64, 128, time_emb_dim)
@@ -51,12 +55,10 @@ class SharedUNet(nn.Module):
         self.mid2 = Block(256, 256, time_emb_dim)
         
         self.up1 = nn.ConvTranspose2d(256, 128, kernel_size=2, stride=2)
-        # FIX: 128 channels (from up1) + 256 channels (skip connection x3) = 384
-        self.up_block1 = Block(384, 128, time_emb_dim) 
+        self.up_block1 = Block(up1_in, 128, time_emb_dim) 
         
         self.up2 = nn.ConvTranspose2d(128, 64, kernel_size=2, stride=2)
-        # FIX: 64 channels (from up2) + 128 channels (skip connection x2) = 192
-        self.up_block2 = Block(192, 64, time_emb_dim) 
+        self.up_block2 = Block(up2_in, 64, time_emb_dim) 
         
         self.outc = nn.Conv2d(64, out_channels, kernel_size=1)
         
@@ -69,16 +71,26 @@ class SharedUNet(nn.Module):
         p3 = self.pool2(x3)
         mid = self.mid1(p3, t)
         mid = self.mid2(mid, t)
+        
         u1 = self.up1(mid)
-        u1 = torch.cat([u1, x3], dim=1)
+        # Dynamically route the skip connection based on how the model was trained
+        if self.up1_in == 384:
+            u1 = torch.cat([u1, x3], dim=1)
+        else:
+            u1 = torch.cat([u1, p2], dim=1)
         u1 = self.up_block1(u1, t)
+        
         u2 = self.up2(u1)
-        u2 = torch.cat([u2, x2], dim=1)
+        # Dynamically route the second skip connection (Fixes the DDPM vs SDE mismatch)
+        if self.up2_in == 192:
+            u2 = torch.cat([u2, x2], dim=1) 
+        else:
+            u2 = torch.cat([u2, x1], dim=1) 
         u2 = self.up_block2(u2, t)
         return self.outc(u2)
 
 # ==========================================
-# 2. BULLETPROOF MODEL LOADER & SCHEDULER
+# 2. SCHEDULER & AUTO-DETECT LOADER
 # ==========================================
 class DDIMScheduler:
     def __init__(self, num_train_timesteps=1000, beta_start=0.0001, beta_end=0.02, device="cpu"):
@@ -104,19 +116,24 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 @st.cache_resource
 def load_model(model_path):
-    model = SharedUNet().to(device)
     try:
+        # Load the raw dictionary of weights
         state_dict = torch.load(model_path, map_location=device)
         if isinstance(state_dict, nn.Module):
             state_dict = state_dict.state_dict()
         clean_state_dict = {k.replace('module.', ''): v for k, v in state_dict.items()}
         
-        # Load the corrected weights
+        # AUTO-DETECT SHAPES: Peek at the layers inside the file
+        up1_in_channels = clean_state_dict['up_block1.conv1.weight'].shape[1] if 'up_block1.conv1.weight' in clean_state_dict else 384
+        up2_in_channels = clean_state_dict['up_block2.conv1.weight'].shape[1] if 'up_block2.conv1.weight' in clean_state_dict else 192
+        
+        # Build the model matching the exact dimensions found inside the file
+        model = SharedUNet(up1_in=up1_in_channels, up2_in=up2_in_channels).to(device)
         model.load_state_dict(clean_state_dict, strict=False)
         model.eval()
         return model
     except Exception as e:
-        st.error(f"Failed to load `{model_path}`. Please check if the file is correctly uploaded to GitHub. (Error details: {e})")
+        st.error(f"Failed to load `{model_path}`. Error details: {e}")
         return None
 
 # ==========================================
