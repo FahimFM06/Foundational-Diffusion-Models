@@ -39,7 +39,6 @@ class Block(nn.Module):
         return self.transform(h) + self.residual_conv(x)
 
 class SharedUNet(nn.Module):
-    # Added dynamic channel variables so the app adapts to the specific checkpoint
     def __init__(self, in_channels=3, out_channels=3, time_emb_dim=256, up1_in=384, up2_in=192):
         super().__init__()
         self.up1_in = up1_in
@@ -73,7 +72,6 @@ class SharedUNet(nn.Module):
         mid = self.mid2(mid, t)
         
         u1 = self.up1(mid)
-        # Dynamically route the skip connection based on how the model was trained
         if self.up1_in == 384:
             u1 = torch.cat([u1, x3], dim=1)
         else:
@@ -81,7 +79,6 @@ class SharedUNet(nn.Module):
         u1 = self.up_block1(u1, t)
         
         u2 = self.up2(u1)
-        # Dynamically route the second skip connection (Fixes the DDPM vs SDE mismatch)
         if self.up2_in == 192:
             u2 = torch.cat([u2, x2], dim=1) 
         else:
@@ -117,17 +114,14 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 @st.cache_resource
 def load_model(model_path):
     try:
-        # Load the raw dictionary of weights
         state_dict = torch.load(model_path, map_location=device)
         if isinstance(state_dict, nn.Module):
             state_dict = state_dict.state_dict()
         clean_state_dict = {k.replace('module.', ''): v for k, v in state_dict.items()}
         
-        # AUTO-DETECT SHAPES: Peek at the layers inside the file
         up1_in_channels = clean_state_dict['up_block1.conv1.weight'].shape[1] if 'up_block1.conv1.weight' in clean_state_dict else 384
         up2_in_channels = clean_state_dict['up_block2.conv1.weight'].shape[1] if 'up_block2.conv1.weight' in clean_state_dict else 192
         
-        # Build the model matching the exact dimensions found inside the file
         model = SharedUNet(up1_in=up1_in_channels, up2_in=up2_in_channels).to(device)
         model.load_state_dict(clean_state_dict, strict=False)
         model.eval()
@@ -203,19 +197,27 @@ with tab2:
             if st.button(f"Run {model_choice} Pipeline"):
                 with st.spinner('Running Reverse Diffusion Process...'):
                     
+                    # 1. Resize and format the uploaded image
                     transform = transforms.Compose([
                         transforms.Resize((32, 32)),
                         transforms.ToTensor(),
                         transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
                     ])
-                    
                     input_tensor = transform(image).unsqueeze(0).to(device)
                     
                     scheduler = DDIMScheduler(device=device)
                     scheduler.set_timesteps(50)
                     
-                    current_image = input_tensor
+                    # 2. Forward Process: Mathematically degrade the image first
+                    noise = torch.randn_like(input_tensor)
+                    start_t = scheduler.timesteps[0]
+                    alpha_cumprod_t = scheduler.alphas_cumprod[start_t]
                     
+                    # Apply the noise formula to the input image
+                    noisy_image = torch.sqrt(alpha_cumprod_t) * input_tensor + torch.sqrt(1.0 - alpha_cumprod_t) * noise
+                    current_image = noisy_image
+                    
+                    # 3. Reverse Process: Denoise
                     for i, t in enumerate(scheduler.timesteps):
                         timestep_tensor = torch.full((1,), t, device=device, dtype=torch.long)
                         prev_t = scheduler.timesteps[i + 1] if i < len(scheduler.timesteps) - 1 else -1
@@ -225,6 +227,7 @@ with tab2:
                             
                         current_image = scheduler.step(predicted_noise, t, prev_t, current_image)
                     
+                    # 4. Format for rendering
                     final_image = (current_image.clamp(-1, 1) + 1) / 2.0
                     final_image = final_image[0].cpu().permute(1, 2, 0).numpy()
                     
