@@ -7,7 +7,7 @@ from PIL import Image
 import numpy as np
 
 # ==========================================
-# 1. SHARED U-NET ARCHITECTURE
+# 1. SHARED U-NET ARCHITECTURE (FIXED DIMENSIONS)
 # ==========================================
 class SinusoidalPositionEmbeddings(nn.Module):
     def __init__(self, dim):
@@ -49,11 +49,17 @@ class SharedUNet(nn.Module):
         self.pool2 = nn.MaxPool2d(2)
         self.mid1 = Block(256, 256, time_emb_dim)
         self.mid2 = Block(256, 256, time_emb_dim)
+        
         self.up1 = nn.ConvTranspose2d(256, 128, kernel_size=2, stride=2)
-        self.up_block1 = Block(256, 128, time_emb_dim)
+        # FIX: 128 channels (from up1) + 256 channels (skip connection x3) = 384
+        self.up_block1 = Block(384, 128, time_emb_dim) 
+        
         self.up2 = nn.ConvTranspose2d(128, 64, kernel_size=2, stride=2)
-        self.up_block2 = Block(128, 64, time_emb_dim)
+        # FIX: 64 channels (from up2) + 128 channels (skip connection x2) = 192
+        self.up_block2 = Block(192, 64, time_emb_dim) 
+        
         self.outc = nn.Conv2d(64, out_channels, kernel_size=1)
+        
     def forward(self, x, t):
         t = self.time_mlp(t)
         x1 = self.inc(x)
@@ -100,17 +106,12 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 def load_model(model_path):
     model = SharedUNet().to(device)
     try:
-        # Load the file
         state_dict = torch.load(model_path, map_location=device)
-        
-        # FIX: If the whole model was accidentally saved instead of state_dict
         if isinstance(state_dict, nn.Module):
             state_dict = state_dict.state_dict()
-            
-        # FIX: Remove 'module.' prefix if saved using DataParallel
         clean_state_dict = {k.replace('module.', ''): v for k, v in state_dict.items()}
         
-        # FIX: strict=False prevents the app from crashing if 1 or 2 keys don't match
+        # Load the corrected weights
         model.load_state_dict(clean_state_dict, strict=False)
         model.eval()
         return model
@@ -124,10 +125,8 @@ def load_model(model_path):
 st.set_page_config(page_title="Diffusion Deblur", layout="wide")
 st.title("Foundational Diffusion Models")
 
-# Create two tabs as requested
 tab1, tab2 = st.tabs(["📖 Project Description", "🛠️ Deblurring Studio"])
 
-# --- PAGE 1: DESCRIPTION ---
 with tab1:
     st.header("Project Overview")
     st.write("""
@@ -149,11 +148,9 @@ with tab1:
     st.write("3. Upload your target image.")
     st.write("4. Click the 'Run Pipeline' button to view the result.")
 
-# --- PAGE 2: STUDIO ---
 with tab2:
     st.header("Deblurring Studio")
     
-    # Model Selection
     model_choice = st.selectbox(
         "Step 1: Select Diffusion Model Architecture", 
         ["DDIM (Fastest)", "DDPM", "Improved DDPM", "Score SDE"]
@@ -189,25 +186,19 @@ with tab2:
             if st.button(f"Run {model_choice} Pipeline"):
                 with st.spinner('Running Reverse Diffusion Process...'):
                     
-                    # 1. Image Processing Pipeline
-                    # We must compress the uploaded image to 32x32 to match the model's training size
                     transform = transforms.Compose([
                         transforms.Resize((32, 32)),
                         transforms.ToTensor(),
                         transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
                     ])
                     
-                    # Convert the user's image to a mathematical tensor
                     input_tensor = transform(image).unsqueeze(0).to(device)
                     
-                    # 2. Diffusion Setup
                     scheduler = DDIMScheduler(device=device)
                     scheduler.set_timesteps(50)
                     
-                    # Instead of pure noise, we feed the uploaded image into the reverse loop
                     current_image = input_tensor
                     
-                    # 3. Reverse Loop
                     for i, t in enumerate(scheduler.timesteps):
                         timestep_tensor = torch.full((1,), t, device=device, dtype=torch.long)
                         prev_t = scheduler.timesteps[i + 1] if i < len(scheduler.timesteps) - 1 else -1
@@ -217,7 +208,6 @@ with tab2:
                             
                         current_image = scheduler.step(predicted_noise, t, prev_t, current_image)
                     
-                    # 4. Post-process the final tensor back into a viewable image
                     final_image = (current_image.clamp(-1, 1) + 1) / 2.0
                     final_image = final_image[0].cpu().permute(1, 2, 0).numpy()
                     
